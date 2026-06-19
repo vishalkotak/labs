@@ -54,6 +54,10 @@ cargo test            # unit tests for the backend and tiering logic
 
 `--release` matters: timing a debug build measures the absence of the optimizer.
 
+## Results
+
+Current DRAM-only baseline numbers are in [BENCHMARKS.md](./BENCHMARKS.md).
+
 ## Page size
 
 `PAGE_SIZE = 4096` matches the common NVMe device block size, which keeps

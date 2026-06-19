@@ -1,7 +1,7 @@
 # Notes: things I had to work through
 
-Not code documentation. Just the concepts I questioned and the decisions
-whose *reasons* I want to remember, in the order they came up.
+Not code documentation. Just the decisions whose *reasons* I want to remember,
+in the order they came up.
 
 ## Why get() fills a caller's buffer instead of returning a Page
 
@@ -16,23 +16,6 @@ fill a caller-provided `&mut Page`.
   zero allocation in the timed loop. The hard backend (NVMe) dictated the
   contract.
 
-## copy_from_slice / clone() are real byte copies, not reference bumps
-
-memcpy of all 4 KiB. Two independent regions afterward. Must be a copy, not a
-shared reference, or the caller would hold something tied to the backend's
-internals that breaks when the map mutates. The copy is unavoidable anyway: a
-disk read physically lands bytes in your buffer. (Rc/Arc::clone share and bump
-a refcount; moving a Box moves the pointer, not the bytes, which are different
-things.)
-
-## .lock().unwrap()
-
-`.lock()` acquires the mutex (waits if someone holds it), returns a guard that
-gives temporary &mut access through a shared &self, which is interior
-mutability. Guard auto-releases the lock when it drops. `.unwrap()` panics if
-the lock was "poisoned" (a thread panicked while holding it); fine for us since
-poisoned state means our cache is already suspect.
-
 ## &self (Backend) vs &mut self (Cache)
 
 - Backend is `&self` because it's the concurrency surface: queue depth = many
@@ -46,21 +29,6 @@ poisoned state means our cache is already suspect.
   the backend's `.await` (a 100us NVMe read), every other request stalls for
   that whole read. The real design releases the lock BEFORE awaiting the slow
   read. The suspension point is the thing you must not straddle with a lock.
-
-## async / await / ? : what they actually do
-
-- `async fn` returns a *future*: an inert computation that does nothing until a
-  runtime (tokio) drives it.
-- `.await` runs the future and, if it can't finish immediately (waiting on
-  disk), *suspends this function* and lets the thread do other work, resuming
-  from the same line when data is ready. Queue depth = many functions suspended
-  at their awaits, all waiting on the device at once. One thread can hold N
-  in-flight I/Os; the blocking model would need N threads.
-- DRAM awaits are ~free (finish on first poll, never suspend). NVMe awaits are
-  where suspension actually happens.
-- `?` is unrelated to await: it's error propagation. On `Err`, return early from
-  this function and hand the error up. `.await?` = wait, then bail if it failed.
-  Only usable in a function that itself returns Result.
 
 ## Logical vs device block size (and why PAGE_SIZE = 4096)
 
