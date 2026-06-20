@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::Arc;
 use tokio::sync::Notify;
+use tokio::sync::Semaphore;
 
 // One KV-cache chunk; a fixed-size run of bytes.
 // 4096 because that's the native block size of
@@ -280,6 +281,7 @@ pub struct BenchResult {
     pub hits: u64,
     pub misses: u64,
     pub evictions: u64,
+    pub coalesced: u64,
     pub hit_rate: f64,
     pub histogram: Histogram<u64>,
 }
@@ -289,34 +291,69 @@ pub async fn run_workload(
     num_pages: u64,
     capacity: usize,
     num_requests: usize,
+    queue_depth: usize,
     seed: u64,
 ) -> io::Result<BenchResult> {
 
+    assert!(queue_depth >= 1, "queue_depth must be at least 1");
     let mut cache = Cache::new(DramBackend::new(), capacity);
     let filler = Page::zeroed();
     for id in 0..num_pages {
         cache.put(id, &filler).await?;
     }
     cache.reset_stats();
+    let cache = Arc::new(cache);
     let requests = generate(pattern, num_pages, num_requests, seed);
-    let mut out = Page::zeroed();
     let mut hist = Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3)
         .expect("valid histogram bounds");
 
-    for &id in &requests {
-        let start = Instant::now();
-        cache.get(id, &mut out).await?;
-        let ns = start.elapsed().as_nanos() as u64;
-        hist.record(ns).expect("latency within histogram bounds");
-    }
+    if queue_depth == 1 {
+        let mut out = Page::zeroed();
+        for &id in &requests {
+            let start = Instant::now();
+            cache.get(id, &mut out).await?;
+            let ns = start.elapsed().as_nanos() as u64;
+            hist.record(ns).expect("latency within histogram bounds");
+        }
+    } else {
+        let sem = Arc::new(Semaphore::new(queue_depth));
+        let hist_shared = Arc::new(Mutex::new(hist));
+        let mut tasks = Vec::with_capacity(requests.len());
+        for &id in &requests {
+            let cache = Arc::clone(&cache);
+            let sem = Arc::clone(&sem);
+            let hist_shared = Arc::clone(&hist_shared);
+            tasks.push(tokio::spawn(async move {
+                let _permit = sem.acquire().await.expect("semaphore not closed");
+                let mut out = Page::zeroed();
+                let start = Instant::now();
+                let res = cache.get(id, &mut out).await;
+                let ns = start.elapsed().as_nanos() as u64;
+                if res.is_ok() {
+                    hist_shared.lock().unwrap()
+                        .record(ns).expect("latency within bounds");
+                }
+                res
+            }));
 
-    Ok(BenchResult {
-        hits: cache.hits(),
-        misses: cache.misses(),
-        evictions: cache.evictions(),
-        hit_rate: cache.hit_rate(),
-        histogram: hist,
-    })
+        }
+        for t in tasks {
+            t.await.expect("task panicked")?;
+        }
+        hist = Arc::try_unwrap(hist_shared)
+            .expect("all tasks done, sole owner")
+            .into_inner()
+            .unwrap();
+        
+        }
+        Ok(BenchResult {
+            hits: cache.hits(),
+            misses: cache.misses(),
+            coalesced: cache.coalesced(),
+            evictions: cache.evictions(),
+            hit_rate: cache.hit_rate(),
+            histogram: hist,
+        })
 }
     
 
