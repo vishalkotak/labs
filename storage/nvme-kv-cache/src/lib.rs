@@ -3,6 +3,8 @@ pub mod workload;
 use std::io;
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::Arc;
+use tokio::sync::Notify;
 
 // One KV-cache chunk; a fixed-size run of bytes.
 // 4096 because that's the native block size of
@@ -81,14 +83,28 @@ struct CacheEntry {
     last_used: u64,
 }
 
-pub struct Cache<B: Backend> {
-    backend: B,
+// A fetch currently in progress for some page. Followers clone the Arc and
+// wait on `ready`; the leader fills `slot` then calls notify_waiters().
+struct InFlight {
+    slot: Mutex<Option<Box<[u8]>>>,
+    ready: Notify,
+}
+
+struct Inner {
     capacity: usize,
     hot: HashMap<PageId, CacheEntry>,
+    inflight: HashMap<PageId, Arc<InFlight>>,
     tick: u64,
     hits: u64,
     misses: u64,
+    coalesced: u64,
     evictions: u64,
+}
+
+// State mutated only while the lock is held.
+pub struct Cache<B: Backend> {
+    backend: B,
+    inner: Mutex<Inner>,
 }
 
 impl<B: Backend> Cache<B> {
@@ -96,86 +112,161 @@ impl<B: Backend> Cache<B> {
         assert!(capacity >= 1, "Capacity must be at least 1");
         Cache {
             backend,
-            capacity,
-            hot: HashMap::new(),
-            tick: 0,
-            hits: 0,
-            misses: 0,
-            evictions: 0,
+            inner: Mutex::new(Inner {
+                capacity,
+                hot: HashMap::new(),
+                inflight: HashMap::new(),
+                tick: 0,
+                hits: 0,
+                misses: 0,
+                coalesced: 0,
+                evictions: 0,
+            }),
         }
     }
 
-    pub async fn get(&mut self, id: PageId, out: &mut Page) -> io::Result<()> {
-        self.tick += 1;
+    pub async fn get(&self, id: PageId, out: &mut Page) -> io::Result<()> {
+        let leader = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.tick += 1;
+            let now = inner.tick;
 
-        // Already in the hot set. Ajust recency and copy out.
-        if let Some(entry) = self.hot.get_mut(&id) {
-            entry.last_used = self.tick;
-            out.data.copy_from_slice(&entry.data);
-            self.hits += 1;
-            return Ok(());
+            if let Some(entry) = inner.hot.get_mut(&id) {
+                entry.last_used = now;
+                out.data.copy_from_slice(&entry.data);
+                inner.hits += 1;
+                return Ok(())
+            }
+
+            if let Some(inflight) = inner.inflight.get(&id) {
+                let handle = Arc::clone(inflight);
+                inner.coalesced += 1;
+                Some((false, handle))
+            } else {
+                let inflight = Arc::new(InFlight {
+                    slot: Mutex::new(None),
+                    ready: Notify::new(),
+                });
+                inner.inflight.insert(id, Arc::clone(&inflight));
+                inner.misses += 1;
+                Some((true, inflight))
+            }
+        };
+        let (is_leader, inflight) = leader.unwrap();
+        if !is_leader {
+            // Subtle ordering: check the slot BEFORE awaiting. If the leader
+            // already filled it and fired notify_waiters() before we started
+            // waiting, the notification is lost — so we must not block on a
+            // notify that already happened.
+            loop {
+                {
+                    let slot = inflight.slot.lock().unwrap();
+                    if let Some(bytes) = slot.as_ref() {
+                        out.data.copy_from_slice(bytes);
+                        return Ok(());
+                    }
+                }
+                    inflight.ready.notified().await;
+            }
         }
 
-        let mut temp = Page::zeroed();
-        self.backend.get(id, &mut temp).await?;
-        out.data.copy_from_slice(&temp.data);
-
-        self.hot.insert(id, CacheEntry { data: temp.data, last_used: self.tick });
-        self.ensure_capacity().await?;
-        self.misses += 1;
-        Ok(())
+        let mut tmp = Page::zeroed();
+        let read_result = self.backend.get(id, &mut tmp).await;
+        match read_result {
+            Ok(()) => {
+                {
+                    let mut slot = inflight.slot.lock().unwrap();
+                    *slot = Some(tmp.data.clone());
+                }
+                inflight.ready.notify_waiters();
+                out.data.copy_from_slice(&tmp.data);
+                let victims = {
+                    let mut inner = self.inner.lock().unwrap();
+                    let now = inner.tick;
+                    inner.hot.insert(id, CacheEntry { data: tmp.data, last_used: now });
+                    inner.inflight.remove(&id);
+                    Cache::<B>::take_eviction_victims(&mut inner)
+                };
+                self.spill(victims).await?;
+                Ok(())
+            }
+            Err(e) => {
+                inflight.ready.notify_waiters();
+                let mut inner = self.inner.lock().unwrap();
+                inner.inflight.remove(&id);
+                Err(e)
+            }
+        }
     }
 
-    pub async fn put(&mut self, id: PageId, page: &Page) -> io::Result<()> {
-        self.tick += 1;
-        self.hot.insert(
-            id,
-            CacheEntry { data: page.data.clone(), last_used: self.tick },
-        );
-        self.ensure_capacity().await?;
-        Ok(())
+    pub async fn put(&self, id: PageId, page: &Page) -> io::Result<()> {
+        let victims = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.tick += 1;
+            let now = inner.tick;
+            inner.hot.insert(id, CacheEntry { data: page.data.clone(), last_used: now });
+            Cache::<B>::take_eviction_victims(&mut inner)
+        };
+        self.spill(victims).await
     }
 
-    async fn ensure_capacity(&mut self) -> io::Result<()> {
-        while self.hot.len() > self.capacity {
-            let victim = self
+    fn take_eviction_victims(
+        inner: &mut Inner,
+    ) -> Vec<(PageId, Box<[u8]>)> {
+        let mut victims = Vec::new();
+        while inner.hot.len() > inner.capacity {
+            let victim = inner
                 .hot
                 .iter()
-                .min_by_key(|(_, e) | e.last_used)
-                .map(|(id, _) | *id)
+                .min_by_key(|(_, e)| e.last_used)
+                .map(|(id, _)| *id)
                 .expect("hot is non-empty because len > capacity >= 1");
-            let entry = self.hot.remove(&victim).expect("victim was just found");
-            let page = Page { data: entry.data };
-            self.backend.put(victim, &page).await?;
-            self.evictions += 1;
+            let entry = inner.hot.remove(&victim).expect("victim was just found");
+            victims.push((victim, entry.data));
+            inner.evictions += 1;
+        }
+        victims
+    }
+
+    async fn spill(&self, victims: Vec<(PageId, Box<[u8]>)>) -> io::Result<()> {
+        for (id, data) in victims {
+            let page = Page { data };
+            self.backend.put(id, &page).await?;
         }
         Ok(())
     }
 
     pub fn hits(&self) -> u64 {
-        self.hits
+        self.inner.lock().unwrap().hits
     }
 
     pub fn misses(&self) -> u64 {
-        self.misses
+        self.inner.lock().unwrap().misses
     }
 
     pub fn evictions(&self) -> u64 {
-        self.evictions
+        self.inner.lock().unwrap().evictions
+    }
+
+    pub fn coalesced(&self) -> u64 {
+        self.inner.lock().unwrap().coalesced
     }
 
     pub fn reset_stats(&mut self) {
-        self.hits = 0;
-        self.misses = 0;
-        self.evictions = 0;
+        let mut inner = self.inner.lock().unwrap();
+        inner.hits = 0;
+        inner.misses = 0;
+        inner.coalesced = 0;
+        inner.evictions = 0;
     }
 
     pub fn hit_rate(&self) -> f64 {
-        let total = self.hits + self.misses;
+        let inner = self.inner.lock().unwrap();
+        let total = inner.hits + inner.misses;
         if total == 0 {
             0.0
         } else {
-            self.hits as f64 / total as f64
+            inner.hits as f64 / total as f64
         }
 
     }
@@ -269,7 +360,7 @@ mod cache_tests {
     #[tokio::test]
     async fn tiering_evicts_and_faults_back() {
         // Cold tier is a DramBackend; hot set holds only 2 pages.
-        let mut cache = Cache::new(DramBackend::new(), 2);
+        let cache = Cache::new(DramBackend::new(), 2);
 
         cache.put(1, &page_filled(0xA1)).await.unwrap(); // hot: {1}
         cache.put(2, &page_filled(0xB2)).await.unwrap(); // hot: {1,2}
@@ -292,3 +383,64 @@ mod cache_tests {
     }
 }
 
+#[cfg(test)]
+mod concurrency_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A backend that wraps DRAM but counts get() calls and adds a small delay,
+    /// so concurrent followers actually overlap with the leader's read.
+    struct CountingBackend {
+        inner: DramBackend,
+        reads: AtomicU64,
+    }
+    impl CountingBackend {
+        fn new() -> Self {
+            CountingBackend { inner: DramBackend::new(), reads: AtomicU64::new(0) }
+        }
+    }
+    impl Backend for CountingBackend {
+        async fn put(&self, id: PageId, page: &Page) -> io::Result<()> {
+            self.inner.put(id, page).await
+        }
+        async fn get(&self, id: PageId, out: &mut Page) -> io::Result<()> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            // Yield + tiny sleep so concurrent callers pile up behind one read.
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            self.inner.get(id, out).await
+        }
+        async fn delete(&self, id: PageId) -> io::Result<()> {
+            self.inner.delete(id).await
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_misses_coalesce_to_one_read() {
+        // Seed page 7 into the backend only (not the hot set), so gets miss.
+        let backend = CountingBackend::new();
+        let mut seed = Page::zeroed();
+        seed.data.fill(0x77);
+        backend.put(7, &seed).await.unwrap();
+
+        let cache = Arc::new(Cache::new(backend, 4));
+
+        // Fire 16 concurrent gets for the same cold page.
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let c = Arc::clone(&cache);
+            handles.push(tokio::spawn(async move {
+                let mut out = Page::zeroed();
+                c.get(7, &mut out).await.unwrap();
+                out.data[0]
+            }));
+        }
+        for h in handles {
+            assert_eq!(h.await.unwrap(), 0x77); // everyone got the right bytes
+        }
+
+        // The whole point: 16 concurrent misses, but only ONE backend read.
+        let reads = cache.backend.reads.load(Ordering::SeqCst);
+        assert_eq!(reads, 1, "single-flight should coalesce to one read, got {reads}");
+        assert_eq!(cache.coalesced(), 15); // 1 leader + 15 followers
+    }
+}
